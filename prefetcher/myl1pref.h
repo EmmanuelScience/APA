@@ -115,7 +115,7 @@ struct SRC_entry_t {
   }
 };
 
-class HybridPrefetcher : public champsim::modules::prefetcher {
+class myl1pref : public champsim::modules::prefetcher {
 private:
   std::vector<TDC_AHT_entry_t> AHT_table;
   std::vector<TDC_PHT_entry_t> PHT_table;
@@ -126,7 +126,11 @@ private:
   uint64_t phase_cycle_counter;
   uint64_t explore_duration_cycles;
   uint64_t exploit_duration_cycles;
-  PrefetchSourceEngine best_engine_for_exploit;
+  //PrefetchSourceEngine best_engine_for_exploit;
+  bool allowed_nl;
+  bool allowed_tdc;
+  bool allowed_src;
+
 
   std::deque<uint64_t> recent_prefetches_nl;
   std::deque<uint64_t> recent_prefetches_tdc;
@@ -137,7 +141,8 @@ private:
   int score_tdc;
   int score_src;
 
-  static const int SCORE_MAX_PQ_HIT = 16384; 
+  static const int SCORE_MAX_PQ_HIT = 2048; 
+  static const int SCORE_THRESHOLD_PREFETCHER = 1024;
 
   static const int PQ_HIT_REWARD_NL  = 1;
   static const int PQ_HIT_REWARD_TDC = 1;
