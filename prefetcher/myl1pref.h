@@ -3,44 +3,39 @@
 
 #include "cache.h"
 #include "modules.h"
-#include "msl/lru_table.h"
 
 #include <vector>
 #include <cstdint>
-#include <iostream>
-#include <iomanip>
-#include <string>
-#include <algorithm>
 #include <deque>
 
 
 // The queues we use to check hits
-constexpr uint64_t MAX_PQ_SIZE = 8;
+constexpr unsigned MAX_PQ_SIZE = 8;
 constexpr unsigned LOG2_CACHE_LINE_SIZE = 6;
 
-// Temporal Delta Correlator
-constexpr uint16_t AHT_INDEX_BITS = 9;
-constexpr uint16_t AHT_NUM_ENTRIES = 1 << AHT_INDEX_BITS;
-constexpr uint16_t AHT_TAG_INITIAL_SHIFT = AHT_INDEX_BITS;
-constexpr uint8_t AHT_DELTA_HISTORY_SIZE = 3;
-constexpr uint16_t TDC_PHT_INDEX_BITS = 11;
-constexpr uint32_t TDC_PHT_NUM_ENTRIES = 1 << TDC_PHT_INDEX_BITS;
-constexpr uint8_t TDC_PHT_CONFIDENCE_MAX = 3; // Used for TDC's internal confidence
+// Delta history tracker
+constexpr unsigned DHT_AHT_INDEX_BITS = 9;
+constexpr unsigned DHT_AHT_NUM_ENTRIES = 1 << DHT_AHT_INDEX_BITS;
+constexpr unsigned DHT_AHT_TAG_INITIAL_SHIFT = DHT_AHT_INDEX_BITS;
+constexpr unsigned DHT_AHT_DELTA_HISTORY_SIZE = 3;
+constexpr unsigned DHT_PHT_INDEX_BITS = 11;
+constexpr unsigned DHT_PHT_NUM_ENTRIES = 1 << DHT_PHT_INDEX_BITS;
+constexpr unsigned DHT_PHT_CONFIDENCE_MAX = 3;
 
-// Spatial Region Correlator
-constexpr unsigned SRC_LINES_PER_REGION_LOG2 = 3;
-constexpr unsigned SRC_LINES_PER_REGION = 1 << SRC_LINES_PER_REGION_LOG2;
-constexpr uint8_t  SRC_REGION_MASK = SRC_LINES_PER_REGION - 1;
-constexpr unsigned SRC_INDEX_BITS = 9;
-constexpr uint32_t SRC_NUM_SETS = 1 << SRC_INDEX_BITS;
-constexpr unsigned SRC_NUM_WAYS = 2;
-constexpr unsigned SRC_ACCESS_DENSITY_THRESHOLD = 3;
+// Region prefetcher
+constexpr unsigned RP_LINES_PER_REGION_LOG2 = 3;
+constexpr unsigned RP_LINES_PER_REGION = 1 << RP_LINES_PER_REGION_LOG2;
+constexpr unsigned RP_REGION_MASK = RP_LINES_PER_REGION - 1;
+constexpr unsigned RP_INDEX_BITS = 9;
+constexpr unsigned RP_NUM_SETS = 1 << RP_INDEX_BITS;
+constexpr unsigned RP_NUM_WAYS = 2;
+constexpr unsigned RP_ACCESS_DENSITY_THRESHOLD = 3;
 
 enum PrefetchSourceEngine {
   NONE = 0, 
   NL  = 1,
-  TDC = 2,
-  SRC = 3
+  DHT = 2,
+  RP = 3
 };
 
 enum PrefetcherPhase {
@@ -49,14 +44,14 @@ enum PrefetcherPhase {
 };
 
 
-// TDC Access History Table (AHT) Entry Structure
-struct TDC_AHT_entry_t {
+//
+struct DHT_AHT_entry_t {
   uint16_t tag : 16;
   uint64_t last_accessed_block : 48;
-  std::array<int16_t, AHT_DELTA_HISTORY_SIZE> delta_history;
+  std::array<int16_t, DHT_AHT_DELTA_HISTORY_SIZE> delta_history;
   bool valid : 1;
 
-  TDC_AHT_entry_t() :
+  DHT_AHT_entry_t() :
     tag(0),
     last_accessed_block(0),
     valid(false) {
@@ -64,7 +59,7 @@ struct TDC_AHT_entry_t {
   }
 
   void record_new_delta(int16_t nd) {
-    for (int i = AHT_DELTA_HISTORY_SIZE - 1; i > 0; i--)
+    for (int i = DHT_AHT_DELTA_HISTORY_SIZE - 1; i > 0; i--)
       delta_history[i] = delta_history[i-1];
     delta_history[0] = nd;
   }
@@ -76,13 +71,13 @@ struct TDC_AHT_entry_t {
   }
 };
 
-struct TDC_PHT_entry_t {
-  std::array<int16_t, AHT_DELTA_HISTORY_SIZE> tag_delta_history;
+struct DHT_PHT_entry_t {
+  std::array<int16_t, DHT_AHT_DELTA_HISTORY_SIZE> tag_delta_history; // Same size of delta history as AHT
   int16_t predicted_next_delta : 10;
   uint8_t confidence : 2;
   bool valid : 1;
 
-  TDC_PHT_entry_t() :
+  DHT_PHT_entry_t() :
     predicted_next_delta(0),
     confidence(0),
     valid(false) {
@@ -96,13 +91,13 @@ struct TDC_PHT_entry_t {
   }
 };
 
-struct SRC_entry_t {
+struct RP_entry_t {
   uint64_t region_address_tag : 40;
   uint8_t access_bitmap : 8;
   uint8_t prefetch_bitmap : 8;
   bool valid : 1;
 
-  SRC_entry_t() :
+  RP_entry_t() :
     region_address_tag(0),
     access_bitmap(0),
     prefetch_bitmap(0),
@@ -117,16 +112,16 @@ struct SRC_entry_t {
 
 class myl1pref : public champsim::modules::prefetcher {
 private:
-  std::vector<TDC_AHT_entry_t> AHT_table;
-  std::vector<TDC_PHT_entry_t> PHT_table;
-  std::vector<std::vector<SRC_entry_t>> SRC_table;
+  std::vector<DHT_AHT_entry_t> AHT_table;
+  std::vector<DHT_PHT_entry_t> PHT_table;
+  std::vector<std::vector<RP_entry_t>> RP_table;
   std::vector<bool> src_lru_way;
 
-  PrefetcherPhase current_phase;
+  PrefetcherPhase current_phase; // bit to track which stage are we on
   uint64_t phase_cycle_counter;
   uint64_t explore_duration_cycles;
   uint64_t exploit_duration_cycles;
-  //PrefetchSourceEngine best_engine_for_exploit;
+
   bool allowed_nl;
   bool allowed_tdc;
   bool allowed_src;
@@ -145,12 +140,12 @@ private:
   static const int SCORE_THRESHOLD_PREFETCHER = 1024;
 
   static const int PQ_HIT_REWARD_NL  = 1;
-  static const int PQ_HIT_REWARD_TDC = 1;
-  static const int PQ_HIT_REWARD_SRC = 1;
+  static const int PQ_HIT_REWARD_DHT = 1;
+  static const int PQ_HIT_REWARD_RP = 1;
 
   uint32_t get_aht_index(uint64_t pc) const;
   uint16_t get_aht_tag(uint64_t pc) const;
-  uint32_t get_pht_tdc_index(const std::array<int16_t, AHT_DELTA_HISTORY_SIZE>& delta_hist) const;
+  uint32_t get_pht_index(const std::array<int16_t, DHT_AHT_DELTA_HISTORY_SIZE>& delta_hist) const;
   uint64_t get_src_region_address(uint64_t block_addr) const;
   uint8_t get_src_offset_in_region(uint64_t block_addr) const;
   uint32_t get_src_set_index(uint64_t region_addr) const;
